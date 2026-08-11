@@ -54,24 +54,31 @@ class GrpcCommunicator(BaseCommunicator):
         retry_delay: float = 5.0,
         max_retries: int = 5,
         client_compressor=None,
-        server_compressor=None
+        server_compressor=None,
+        communicate_params: bool = True,
+        normalize_by_total_samples: bool = False,
+        backend: object = None,
+        **kwargs: object,
     ) -> None:
         """
         Initialize gRPC-based federated learning communicator.
 
-        Args:
-            rank: Process rank (0 becomes server, others become clients)
-            world_size: Total number of participants in FL experiment
-            master_addr: gRPC server address (rank 0 listens here)
-            master_port: gRPC server port
-            max_workers: Thread pool size for gRPC server
-            max_send_message_length: Maximum outbound message size in bytes
-            max_receive_message_length: Maximum inbound message size in bytes
-            aggregation_timeout: Server timeout waiting for all clients (seconds)
-            client_timeout: Client timeout waiting for aggregation result (seconds)
-            retry_delay: Seconds between connection retry attempts
-            max_retries: Maximum connection retry attempts
+        ``backend`` is accepted (and ignored) when Hydra merges TorchDist leftovers.
         """
+        if backend is not None:
+            warnings.warn(
+                f"GrpcCommunicator ignores TorchDist-only argument backend={backend!r}",
+                stacklevel=2,
+            )
+        if kwargs:
+            warnings.warn(
+                f"GrpcCommunicator ignoring unused keyword arguments: {sorted(kwargs)}",
+                stacklevel=2,
+            )
+
+        # slurm_worker uses ``backend`` only to pick CUDA vs CPU (no torch.distributed PG).
+        self.backend = "nccl" if torch.cuda.is_available() else "gloo"
+
         super().__init__(rank, world_size, master_addr, master_port)
         print(f"rank={rank}/{world_size} | addr={master_addr}:{master_port}")
 
@@ -99,6 +106,9 @@ class GrpcCommunicator(BaseCommunicator):
         self._servicer = None
         self.client_compressor = client_compressor
         self.server_compressor = server_compressor
+        self.communicate_params = bool(communicate_params)
+        self.normalize_by_total_samples = bool(normalize_by_total_samples)
+        self._aggregation_num_samples = 0
 
     @property
     def client(self):
@@ -174,7 +184,12 @@ class GrpcCommunicator(BaseCommunicator):
                 ],
             )
 
-            self._servicer = GrpcServer(world_size=self.world_size, compressor=self.server_compressor)
+            self._servicer = GrpcServer(
+                world_size=self.world_size,
+                compressor=self.server_compressor,
+                communicate_params=self.communicate_params,
+                normalize_by_total_samples=self.normalize_by_total_samples,
+            )
             grpc_pb2_grpc.add_GrpcServerServicer_to_server(self._servicer, self._server)
 
             self._server.add_insecure_port(f"[::]:{self.master_port}")
@@ -190,9 +205,11 @@ class GrpcCommunicator(BaseCommunicator):
                 retry_delay=self.retry_delay,
                 max_retries=self.max_retries,
                 client_timeout=self.client_timeout,
-                compressor=self.client_compressor
+                compressor=self.client_compressor,
+                communicate_params=self.communicate_params,
             )
-    
+            if self.logger is not None:
+                self._client.set_logger(self.logger)
 
     def broadcast(
         self,
@@ -224,11 +241,14 @@ class GrpcCommunicator(BaseCommunicator):
             return self._apply_tensordict_to_msg(msg, tensordict)
 
     def set_logger(self, logger: MetricLogger):
+        """Attach metrics logger; forward to gRPC client when it exists."""
         self.logger = logger
-        try:
-            self.client.set_logger(logger)
-        except Exception:
-            pass
+        if self._client is not None:
+            self._client.set_logger(logger)
+
+    def set_aggregation_num_samples(self, num_samples: int) -> None:
+        """Sample count for the next ``aggregate()`` call (classic grad Path A/B)."""
+        self._aggregation_num_samples = max(int(num_samples), 0)
 
     def aggregate(
         self,
@@ -279,15 +299,24 @@ class GrpcCommunicator(BaseCommunicator):
             result = dict()
             for name, param in msg.named_parameters():
                 if param.requires_grad:
-                    result[name] = param.data
-            # Include buffers (batch norm stats, etc.) - only floating-point buffers
-            for name, buffer in msg.named_buffers():
-                if buffer is None:  # type: ignore
-                    warnings.warn(f"Buffer '{name}' is None, skipping serialization")
-                    continue
-                if not buffer.dtype.is_floating_point:
-                    continue  # Skip integer buffers like num_batches_tracked
-                result[name] = buffer.data
+                    if self.communicate_params:
+                        result[name] = param.data
+                    elif param.grad is not None:
+                        result[name] = param.grad.detach()
+                    else:
+                        result[name] = torch.zeros_like(param.data)
+            # Param FedAvg only: BN running stats are sample-weighted separately in
+            # grad mode (including them in SUM / sample-weighted grad agg corrupts BN).
+            if self.communicate_params:
+                for name, buffer in msg.named_buffers():
+                    if buffer is None:  # type: ignore
+                        warnings.warn(
+                            f"Buffer '{name}' is None, skipping serialization"
+                        )
+                        continue
+                    if not buffer.dtype.is_floating_point:
+                        continue  # Skip integer buffers like num_batches_tracked
+                    result[name] = buffer.data
             return result
         elif isinstance(msg, dict):
             return msg
@@ -315,26 +344,27 @@ class GrpcCommunicator(BaseCommunicator):
         """
         if isinstance(msg, nn.Module):
             with torch.no_grad():
-                # Apply parameters
+                # Apply parameters or aggregated gradients
                 for name, param in msg.named_parameters():
                     if param.requires_grad and name in tensordict:
-                        # Ensure tensor is on the same device as the parameter before copying
                         tensor = tensordict[name].to(param.device)
-                        param.data.copy_(tensor)
-                # Apply buffers (batch norm stats, etc.) - only floating-point buffers
-                for name, buffer in msg.named_buffers():
-                    if buffer is None:  # type: ignore
-                        warnings.warn(
-                            f"Buffer '{name}' is None, skipping deserialization"
-                        )
-                        continue
-                    if not buffer.dtype.is_floating_point:
-                        continue  # Skip integer buffers like num_batches_tracked
-                    if name not in tensordict:
-                        continue  # Buffer not in received data
-                    # Ensure tensor is on the same device as the buffer before copying
-                    tensor = tensordict[name].to(buffer.device)
-                    buffer.data.copy_(tensor)
+                        if self.communicate_params:
+                            param.data.copy_(tensor)
+                        else:
+                            param.grad = tensor
+                if self.communicate_params:
+                    for name, buffer in msg.named_buffers():
+                        if buffer is None:  # type: ignore
+                            warnings.warn(
+                                f"Buffer '{name}' is None, skipping deserialization"
+                            )
+                            continue
+                        if not buffer.dtype.is_floating_point:
+                            continue  # Skip integer buffers like num_batches_tracked
+                        if name not in tensordict:
+                            continue  # Buffer not in received data
+                        tensor = tensordict[name].to(buffer.device)
+                        buffer.data.copy_(tensor)
             return msg
         elif isinstance(msg, dict):
             return tensordict
@@ -359,7 +389,14 @@ class GrpcCommunicator(BaseCommunicator):
             current_session = self._submit_server_data(tensordict, reduction)
             return self._wait_for_aggregation_result(current_session)
         else:
-            self.client.submit_for_aggregation(tensordict, reduction)
+            if not self.client.submit_for_aggregation(
+                tensordict,
+                reduction,
+                num_samples=self._aggregation_num_samples,
+            ):
+                raise RuntimeError(
+                    "gRPC aggregation submit failed (see server log for session errors)"
+                )
             return self.client.get_aggregation_result()
 
     def _submit_server_data(self, tensordict: dict, reduction: AggregationOp) -> int:
@@ -386,8 +423,19 @@ class GrpcCommunicator(BaseCommunicator):
                     f"Reduction type mismatch - expected {session_state['reduction_type']}, got {reduction_str}"
                 )
 
-            # Store server data
-            session_state["data"]["server"] = tensordict
+            # Store server data (CPU tensors — server aggregates, does not train on GPU).
+            if isinstance(tensordict, dict):
+                session_state["data"]["server"] = {
+                    key: tensor.cpu() if torch.is_tensor(tensor) else tensor
+                    for key, tensor in tensordict.items()
+                }
+            elif torch.is_tensor(tensordict):
+                session_state["data"]["server"] = tensordict.cpu()
+            else:
+                session_state["data"]["server"] = tensordict
+            session_state["total_samples"] = int(
+                session_state.get("total_samples", 0)
+            ) + int(self._aggregation_num_samples)
             data_count = len(session_state["data"])
 
             print(
@@ -425,7 +473,9 @@ class GrpcCommunicator(BaseCommunicator):
         if session_state["result"] is None:
             raise RuntimeError(f"No result available for session {session_id}")
 
-        return session_state["result"]
+        result = session_state["result"]
+        self.servicer.mark_aggregation_result_delivered(session_id, "server")
+        return result
 
     def close(self):
         """
