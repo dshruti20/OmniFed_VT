@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import warnings
 from concurrent import futures
 
@@ -109,6 +111,16 @@ class GrpcCommunicator(BaseCommunicator):
         self.communicate_params = bool(communicate_params)
         self.normalize_by_total_samples = bool(normalize_by_total_samples)
         self._aggregation_num_samples = 0
+        self._agg_device = torch.device("cpu")
+
+    def set_agg_device(self, device: torch.device | str) -> None:
+        """Wire resolver ``agg_device`` into client compress/decompress and server SUM."""
+        self._agg_device = torch.device(device)
+        if getattr(self, "_servicer", None) is not None:
+            self._servicer.set_agg_device(self._agg_device)
+        if getattr(self, "_client", None) is not None:
+            self._client.agg_device = self._agg_device
+        print(f"[grpc] agg_device={self._agg_device}")
 
     @property
     def client(self):
@@ -189,6 +201,7 @@ class GrpcCommunicator(BaseCommunicator):
                 compressor=self.server_compressor,
                 communicate_params=self.communicate_params,
                 normalize_by_total_samples=self.normalize_by_total_samples,
+                agg_device=getattr(self, "_agg_device", torch.device("cpu")),
             )
             grpc_pb2_grpc.add_GrpcServerServicer_to_server(self._servicer, self._server)
 
@@ -207,6 +220,7 @@ class GrpcCommunicator(BaseCommunicator):
                 client_timeout=self.client_timeout,
                 compressor=self.client_compressor,
                 communicate_params=self.communicate_params,
+                agg_device=getattr(self, "_agg_device", torch.device("cpu")),
             )
             if self.logger is not None:
                 self._client.set_logger(self.logger)
@@ -423,20 +437,20 @@ class GrpcCommunicator(BaseCommunicator):
                     f"Reduction type mismatch - expected {session_state['reduction_type']}, got {reduction_str}"
                 )
 
-            # Store server data (CPU tensors — server aggregates, does not train on GPU).
+            # Running SUM/MAX into one accumulator (device = servicer agg_device).
             if isinstance(tensordict, dict):
-                session_state["data"]["server"] = {
-                    key: tensor.cpu() if torch.is_tensor(tensor) else tensor
-                    for key, tensor in tensordict.items()
-                }
+                payload = tensordict
             elif torch.is_tensor(tensordict):
-                session_state["data"]["server"] = tensordict.cpu()
+                payload = tensordict
             else:
-                session_state["data"]["server"] = tensordict
+                payload = tensordict
+            self.servicer._accumulate_into_session(
+                session_state, "server", payload
+            )
             session_state["total_samples"] = int(
                 session_state.get("total_samples", 0)
             ) + int(self._aggregation_num_samples)
-            data_count = len(session_state["data"])
+            data_count = self.servicer._submitted_count(session_state)
 
             print(
                 f"Server submit | session={current_session} | {data_count}/{self.servicer.world_size}"

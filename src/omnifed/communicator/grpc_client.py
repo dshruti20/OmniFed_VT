@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import time
 from typing import Dict
 import warnings
@@ -63,6 +65,7 @@ class GrpcClient:
         client_timeout: float = 60,
         compressor=None,
         communicate_params: bool = True,
+        agg_device: torch.device | str | None = None,
     ):
         """
         Initialize gRPC client with connection and retry settings.
@@ -91,6 +94,7 @@ class GrpcClient:
         # self.compressor = TopKCompression(compress_ratio=0.01)
         self.compressor = compressor
         self.communicate_params = bool(communicate_params)
+        self.agg_device = torch.device(agg_device or "cpu")
         # self.compressor = None
         self.last_tensordict_submitted = None
         self.logger = None
@@ -296,6 +300,7 @@ class GrpcClient:
                         tensordict, is_model_communicated = proto_to_tensordict_extended(
                             response.tensor_dict,
                             overlay_base=None,
+                            compute_device=self.agg_device,
                         )
                     if self.logger:
                         accumulate_iter_comm(

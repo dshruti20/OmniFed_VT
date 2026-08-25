@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.omnifed.slurm_worker import (
     _grpc_server_ready_marker,
@@ -64,6 +64,22 @@ class TestResolveSlurmDevice(unittest.TestCase):
             node, rank=1, local_rank=0, local_comm=self._grpc_server_comm()
         )
         self.assertEqual(str(dev), "cuda:1")
+
+    def test_grpc_server_auto_model_stays_cpu(self) -> None:
+        node = MagicMock()
+        node.device_hint = "auto"
+        comm = self._grpc_server_comm()
+        comm.is_server = True
+        comm.backend = "nccl"
+        with patch(
+            "src.omnifed.device_resolver.torch.cuda.is_available", return_value=True
+        ), patch(
+            "src.omnifed.device_resolver.torch.cuda.device_count", return_value=1
+        ):
+            dev = _resolve_slurm_device(
+                node, rank=0, local_rank=0, local_comm=comm
+            )
+        self.assertEqual(dev.type, "cpu")
 
 
 if __name__ == "__main__":

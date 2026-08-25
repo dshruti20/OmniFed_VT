@@ -12,6 +12,10 @@ from omegaconf import OmegaConf
 import torch
 import torch.distributed as dist
 
+from src.omnifed.device_resolver import (
+    cuda_device_for_local_rank,
+    resolve_slurm_devices,
+)
 from src.omnifed.engine_communication import communication_mode
 from src.omnifed.classic.classic_grad_config import (
     classic_aggregate_payload_from_cfg,
@@ -111,46 +115,18 @@ def _resolve_slurm_device(
     local_rank: int,
     local_comm,
 ) -> torch.device:
-    """Pick compute device for this Slurm task (classic centralized path).
-
-    Honors ``topology.overrides.<rank>.device_hint`` when set (e.g. ``cpu`` for
-    rank-0 gRPC server). Otherwise trainers and rank-0 server use GPU when the
-    communicator reports an NCCL backend and CUDA is available.
-    """
-    device_hint = getattr(node_cfg, "device_hint", "auto")
-
-    if device_hint != "auto":
-        print(f"[slurm_worker] Explicit device_hint={device_hint}", flush=True)
-        return torch.device(device_hint)
-
-    backend = getattr(local_comm, "backend", "gloo").lower()
-    use_cuda = (backend == "nccl") and torch.cuda.is_available()
-    if use_cuda:
-        return _resolve_device_auto(local_rank)
-    return torch.device("cpu")
+    """Model device for this Slurm task (classic path). See ``resolve_slurm_devices``."""
+    return resolve_slurm_devices(
+        node_cfg, rank=rank, local_rank=local_rank, local_comm=local_comm
+    ).model_device
 
 
 def _resolve_device_auto(rank: Optional[int]) -> torch.device:
-    """
-    Auto device resolver: GPU if available, otherwise CPU.
-    Uses round-robin by local rank when multiple GPUs are present.
-    """
-
-    # Auto-assignment with GPU detection
-    gpu_count = torch.cuda.device_count()
-    if gpu_count == 0:
-        print("Auto: CPU (no GPUs available)")
-        return torch.device("cpu")
-
-    # Round-robin GPU assignment
-    effective_rank = rank if rank is not None else 0
+    """GPU by local rank, or CPU if this process sees no CUDA device."""
     if rank is None:
         warnings.warn("No rank provided, defaulting to GPU 0")
-
-    gpu_id = effective_rank % gpu_count
-    device_str = f"cuda:{gpu_id}"
-    print(f"Auto: {device_str} (rank {effective_rank}, {gpu_count} GPUs)")
-    return torch.device(device_str)
+        rank = 0
+    return cuda_device_for_local_rank(rank)
 
 
 def _gpu_probe(prefix: str = "GPU"):
@@ -385,10 +361,17 @@ def main():
     algorithm   = instantiate(node_cfg.algorithm, log_dir=node_log_dir)
 
     # ---------- Device selection ----------
-    device = _resolve_slurm_device(
+    devices = resolve_slurm_devices(
         node_cfg, rank=rank, local_rank=local_rank, local_comm=local_comm
     )
-    backend = getattr(local_comm, "backend", "gloo").lower()
+    device = devices.model_device
+    print(
+        f"[slurm_worker] rank={rank} model_device={device} "
+        f"agg_device={devices.agg_device}",
+        flush=True,
+    )
+    if hasattr(local_comm, "set_agg_device"):
+        local_comm.set_agg_device(devices.agg_device)
     original_device = next(model.parameters()).device
     model = model.to(device, non_blocking=True)
 

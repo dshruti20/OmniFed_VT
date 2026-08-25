@@ -107,6 +107,36 @@ class TestGrpcServerSampleWeighted(unittest.TestCase):
         server.mark_aggregation_result_delivered(session_id, "2")
         self.assertNotIn(session_id, server.aggregation_state)
 
+    def test_running_sum_does_not_keep_all_client_copies(self) -> None:
+        server = GrpcServer(world_size=3, communicate_params=False)
+        session_id = server.current_aggregation_session
+        session_state = server.aggregation_state[session_id]
+        session_state["reduction_type"] = AggregationOp.SUM.value
+        server._accumulate_into_session(
+            session_state, "1", {"w": torch.tensor([1.0, 2.0])}
+        )
+        server._accumulate_into_session(
+            session_state, "2", {"w": torch.tensor([3.0, 4.0])}
+        )
+        self.assertEqual(session_state["data"], {})
+        self.assertEqual(session_state["participants"], {"1", "2"})
+        torch.testing.assert_close(
+            session_state["accum"]["w"], torch.tensor([4.0, 6.0])
+        )
+        self.assertFalse(
+            server.perform_aggregation_if_ready(session_state, session_id)
+        )
+        server._accumulate_into_session(
+            session_state, "server", {"w": torch.tensor([0.0, 0.0])}
+        )
+        self.assertTrue(
+            server.perform_aggregation_if_ready(session_state, session_id)
+        )
+        torch.testing.assert_close(
+            session_state["result"]["w"], torch.tensor([4.0, 6.0])
+        )
+        self.assertIsNone(session_state["accum"])
+
 
 if __name__ == "__main__":
     unittest.main()

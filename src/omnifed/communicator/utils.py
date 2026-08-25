@@ -19,6 +19,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.omnifed.device_resolver import is_cuda_oom, try_mapping_to_device
+
 from . import grpc_pb2
 from collections import defaultdict
 from .compression.sparsification import TopKCompression
@@ -310,9 +312,48 @@ def proto_to_tensordict(
 
     return tensordict
 
+
+def _place_cpu_tensor(tensor: torch.Tensor, compute_device: Optional[Any]) -> torch.Tensor:
+    """Protobuf unpack is CPU; optionally move to ``compute_device`` (OOM → CPU)."""
+    if compute_device is None:
+        return tensor
+    placed, _used = try_mapping_to_device(tensor, compute_device)
+    return placed
+
+
+def _topk_dense_from_numpy(
+    values: np.ndarray,
+    indices: np.ndarray,
+    numel: int,
+    original_shape,
+    numpy_dtype,
+    compute_device: Optional[Any],
+) -> torch.Tensor:
+    """Zero-fill + scatter. Try GPU when ``compute_device`` is CUDA; OOM → CPU."""
+    wanted = torch.device(compute_device) if compute_device is not None else torch.device("cpu")
+    if wanted.type == "cuda":
+        try:
+            values_t = torch.from_numpy(np.ascontiguousarray(values)).to(wanted)
+            indices_t = torch.from_numpy(
+                np.ascontiguousarray(indices, dtype=np.int64)
+            ).to(wanted)
+            dense = torch.zeros(numel, dtype=values_t.dtype, device=wanted)
+            dense.scatter_(0, indices_t, values_t)
+            return dense.view(tuple(original_shape))
+        except Exception as exc:
+            if not is_cuda_oom(exc):
+                raise
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    dense_np = np.zeros(numel, dtype=numpy_dtype)
+    dense_np[indices] = values
+    return torch.from_numpy(dense_np.reshape(tuple(original_shape)).copy())
+
+
 def proto_to_tensordict_extended(
     proto_tensordict,
     overlay_base: Optional[Any] = None,
+    compute_device: Optional[Any] = None,
 ) -> tuple[Dict[str, torch.Tensor], bool]:
     """
     Convert protobuf TensorDict back to PyTorch tensors.
@@ -321,6 +362,9 @@ def proto_to_tensordict_extended(
     For sync grad aggregation, pass ``overlay_base=None`` so Top-K entries
     zero-fill then scatter (full sparse message). Pass a tensor dict only when
     intentionally overlaying sparse values onto an existing base (legacy paths).
+
+    Unpack is always from CPU bytes. Pass ``compute_device`` (client/server
+    ``agg_device``) to run decompress on GPU when it fits.
     """
     tensordict = {}
 
@@ -381,11 +425,17 @@ def proto_to_tensordict_extended(
                 flat[indices] = values
                 dense = flat.reshape(entry.original_shape)
                 is_model_communicated = True
+                numpy_array = dense.reshape(tuple(entry.original_shape))
             else:
-                dense = np.zeros(numel, dtype=numpy_dtype)
-                dense[indices] = values
-
-            numpy_array = dense.reshape(tuple(entry.original_shape))
+                tensordict[entry.key] = _topk_dense_from_numpy(
+                    values,
+                    indices,
+                    numel,
+                    entry.original_shape,
+                    numpy_dtype,
+                    compute_device,
+                )
+                continue
 
         elif compression_type == QSGDQuantCompression.__name__:
             if not entry.meta_tensor:
@@ -405,13 +455,17 @@ def proto_to_tensordict_extended(
                 tuple(entry.original_shape)
             )
             norm = float(np.frombuffer(entry.meta_tensor, dtype=np.float32)[0])
+            signed_t = torch.from_numpy(np.array(signed_levels, copy=True))
+            if compute_device is not None:
+                signed_t, _used = try_mapping_to_device(signed_t, compute_device)
             restored = QSGDQuantCompression.decompress_quantized(
-                torch.from_numpy(signed_levels.copy()),
+                signed_t,
                 norm,
                 int(entry.level),
                 tuple(entry.original_shape),
             )
-            numpy_array = restored.detach().cpu().numpy()
+            tensordict[entry.key] = restored
+            continue
 
         elif compression_type is None:
             if len(entry.data) != entry.data_size:
@@ -428,8 +482,8 @@ def proto_to_tensordict_extended(
                 f"Unsupported compression type: {compression_type}, the type is {type(compression_type)}"
             )
 
-        tensor = torch.from_numpy(numpy_array.copy()).to(entry.device)
-        tensordict[entry.key] = tensor
+        tensor = torch.from_numpy(numpy_array.copy())
+        tensordict[entry.key] = _place_cpu_tensor(tensor, compute_device)
 
     return tensordict, is_model_communicated
 

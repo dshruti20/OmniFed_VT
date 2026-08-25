@@ -89,6 +89,63 @@ class TestGrpcTopkClassicSyncGrad(unittest.TestCase):
         dense = compress_message_tensors(payload, None, "grad")
         self.assertIs(dense["running_mean"], bn)
 
+    def test_topk_stays_on_input_tensor_device(self) -> None:
+        """yaml device=cpu must not move a GPU (or CPU) tensor before torch.topk."""
+        cpu_grad = torch.tensor([1.0, 0.0, -2.0, 3.0])
+        (values, indices), ctx = self.compressor.compress(cpu_grad.clone(), "w_cpu")
+        self.assertEqual(values.device.type, "cpu")
+        restored = self.compressor.decompress((values, indices), ctx)
+        self.assertEqual(restored.device.type, "cpu")
+
+        if not torch.cuda.is_available():
+            return
+        gpu_grad = cpu_grad.cuda()
+        (gvals, gix), gctx = self.compressor.compress(gpu_grad.clone(), "w_gpu")
+        self.assertEqual(gvals.device.type, "cuda")
+        restored_gpu = self.compressor.decompress((gvals, gix), gctx)
+        self.assertEqual(restored_gpu.device.type, "cuda")
+        proto = tensordict_to_proto(
+            {
+                "w": {
+                    "values": gvals,
+                    "indices": gix,
+                    "original_shape": gpu_grad.shape,
+                    "ctx": gctx,
+                }
+            },
+            compressor_proto_name(self.compressor),
+        )
+        decoded, _ = proto_to_tensordict_extended(proto, overlay_base=None)
+        self.assertEqual(decoded["w"].device.type, "cpu")
+
+    def test_compress_cuda_oom_retries_on_cpu(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        compressor = TopKCompression(device="cpu", compress_ratio=0.5)
+        gpu_grad = torch.tensor([1.0, 0.0, -2.0, 3.0], device="cuda")
+        calls = {"n": 0}
+
+        def flaky_topk(tensor, compress_ratio):
+            del compress_ratio
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            k = max(1, int(tensor.numel() * 0.5))
+            _, indices = torch.topk(tensor.abs().flatten(), k, sorted=False)
+            values = torch.gather(tensor.flatten(), 0, indices)
+            return values, indices
+
+        from unittest import mock
+
+        with mock.patch(
+            "src.omnifed.communicator.compression.sparsification.topk_sparse",
+            side_effect=flaky_topk,
+        ):
+            (values, indices), ctx = compressor.compress(gpu_grad.clone(), "w_oom")
+        self.assertEqual(values.device.type, "cpu")
+        restored = compressor.decompress((values, indices), ctx)
+        self.assertEqual(restored.device.type, "cpu")
+
 
 if __name__ == "__main__":
     unittest.main()

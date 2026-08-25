@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import torch
 
+from src.omnifed.device_resolver import is_cuda_oom
+
 from . import Compression
 
 QSGD_COMPRESSION_NAME = "QSGDQuantCompression"
@@ -85,7 +87,14 @@ class QSGDQuantCompression(Compression):
         del name
         if not should_compress_tensor(tensor):
             return tensor, -1, -1, -1
-        return self._do_compress(tensor)
+        try:
+            return self._do_compress(tensor)
+        except Exception as exc:
+            if not (tensor.is_cuda and is_cuda_oom(exc)):
+                raise
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return self._do_compress(tensor.detach().cpu())
 
     @staticmethod
     def decompress_quantized(
