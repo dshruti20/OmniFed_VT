@@ -7,11 +7,7 @@ defaults:
 
 topology:
   local_comm:
-    client_compressor:
-      _target_: src.omnifed.communicator.compression.quantization.QSGDQuantCompression
-      device: cpu
-      bit_width: 4
-    server_compressor:
+    compressor:
       _target_: src.omnifed.communicator.compression.quantization.QSGDQuantCompression
       device: cpu
       bit_width: 4

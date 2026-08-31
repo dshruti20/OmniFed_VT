@@ -23,12 +23,7 @@ from torch import nn
 
 from ..utils import print
 from .base import AggregationOp, BaseCommunicator
-from .compression.torchdist_collectives import (
-    aggregate_qsgd_tensor,
-    aggregate_topk_tensor,
-    is_qsgd_compressor,
-    is_topk_compressor,
-)
+from .compression import is_compressor, resolve_compressor
 from .utils import get_msg_info
 
 _GRPC_CFG_ALIASES = frozenset(
@@ -100,10 +95,11 @@ class TorchDistCommunicator(BaseCommunicator):
                 f"TorchDistCommunicator ignoring unused keyword arguments: {sorted(unused)}",
                 stacklevel=2,
             )
-        del server_compressor
         super().__init__(rank, world_size, master_addr, master_port)
         self.communicate_params = bool(communicate_params)
-        self.compressor = compressor if compressor is not None else client_compressor
+        self.compressor = resolve_compressor(
+            compressor, client_compressor, server_compressor
+        )
         self._aggregation_num_samples = 0
         self.logger = None
         compressor_name = (
@@ -196,23 +192,17 @@ class TorchDistCommunicator(BaseCommunicator):
         if active is None:
             dist.all_reduce(tensor, op=op)
             return tensor
-        if is_topk_compressor(active):
-            return aggregate_topk_tensor(
-                active,
-                tensor,
-                name=name,
-                world_size=self.world_size,
-                logger=self.logger,
+        if not is_compressor(active):
+            raise TypeError(
+                f"TorchDist compressor must extend Compression, got {type(active)!r}"
             )
-        if is_qsgd_compressor(active):
-            return aggregate_qsgd_tensor(
-                active,
-                tensor,
-                name=name,
-                op=op,
-                logger=self.logger,
-            )
-        raise TypeError(f"Unsupported TorchDist compressor: {type(active)!r}")
+        return active.aggregate_torchdist(
+            tensor,
+            name=name,
+            world_size=self.world_size,
+            op=op,
+            logger=self.logger,
+        )
 
     @staticmethod
     def _module_aggregate_tensor(param: nn.Parameter, *, communicate_params: bool) -> torch.Tensor:

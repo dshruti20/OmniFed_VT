@@ -25,6 +25,7 @@ from ..utils import print
 from ..utils import MetricLogger
 from . import BaseCommunicator, grpc_pb2_grpc
 from .base import AggregationOp
+from .compression import resolve_compressor
 from .grpc_client import GrpcClient
 from .grpc_server import GrpcServer
 from .utils import get_msg_info
@@ -55,6 +56,7 @@ class GrpcCommunicator(BaseCommunicator):
         client_timeout: float = 60.0,
         retry_delay: float = 5.0,
         max_retries: int = 5,
+        compressor=None,
         client_compressor=None,
         server_compressor=None,
         communicate_params: bool = True,
@@ -106,8 +108,9 @@ class GrpcCommunicator(BaseCommunicator):
         self._server = None
         self._client = None
         self._servicer = None
-        self.client_compressor = client_compressor
-        self.server_compressor = server_compressor
+        self.compressor = resolve_compressor(
+            compressor, client_compressor, server_compressor
+        )
         self.communicate_params = bool(communicate_params)
         self.normalize_by_total_samples = bool(normalize_by_total_samples)
         self._aggregation_num_samples = 0
@@ -198,7 +201,7 @@ class GrpcCommunicator(BaseCommunicator):
 
             self._servicer = GrpcServer(
                 world_size=self.world_size,
-                compressor=self.server_compressor,
+                compressor=self.compressor,
                 communicate_params=self.communicate_params,
                 normalize_by_total_samples=self.normalize_by_total_samples,
                 agg_device=getattr(self, "_agg_device", torch.device("cpu")),
@@ -218,7 +221,7 @@ class GrpcCommunicator(BaseCommunicator):
                 retry_delay=self.retry_delay,
                 max_retries=self.max_retries,
                 client_timeout=self.client_timeout,
-                compressor=self.client_compressor,
+                compressor=self.compressor,
                 communicate_params=self.communicate_params,
                 agg_device=getattr(self, "_agg_device", torch.device("cpu")),
             )

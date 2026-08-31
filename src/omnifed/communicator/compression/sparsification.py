@@ -129,6 +129,22 @@ class TopKCompression(Compression):
             tensor_decompressed = topk_desparse((values, indices), numel, values.device)
         return tensor_decompressed.view(shape)
 
+    def aggregate_torchdist(
+        self,
+        tensor,
+        *,
+        name: str,
+        world_size: int,
+        op,
+        logger=None,
+    ):
+        del op
+        from .torchdist_collectives import aggregate_topk_tensor
+
+        return aggregate_topk_tensor(
+            self, tensor, name=name, world_size=world_size, logger=logger
+        )
+
 
 class DGCCompression(Compression):
     """Implementation of Deep Gradient Compression (DGC) lossy sparsification

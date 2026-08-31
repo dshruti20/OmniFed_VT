@@ -115,5 +115,21 @@ class QSGDQuantCompression(Compression):
         signed_levels = tensors[0] if isinstance(tensors, (tuple, list)) else tensors
         return self.decompress_quantized(signed_levels, norm, levels, shape)
 
+    def aggregate_torchdist(
+        self,
+        tensor,
+        *,
+        name: str,
+        world_size: int,
+        op,
+        logger=None,
+    ):
+        del world_size
+        from .torchdist_collectives import aggregate_qsgd_tensor
+
+        return aggregate_qsgd_tensor(
+            self, tensor, name=name, op=op, logger=logger
+        )
+
 
 _quantized_compression_ = [QSGD_COMPRESSION_NAME]
